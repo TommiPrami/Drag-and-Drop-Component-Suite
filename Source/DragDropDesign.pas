@@ -25,7 +25,7 @@ implementation
 uses
   DesignIntf,
   DesignEditors,
-  System.Classes;
+  System.Classes,
   DragDrop,
   DropSource,
   DropTarget,
