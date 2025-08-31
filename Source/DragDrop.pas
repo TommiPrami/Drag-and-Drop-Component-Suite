@@ -305,6 +305,9 @@ type
     function HasData: boolean; virtual; abstract;
     { Determines if the object needs/can use *more* data }
     function NeedsData: boolean; virtual;
+    { Determines if the object needs data from the specified clipboard format.
+      Assumes NeedsData has already been called and returned True }
+    function NeedDataFrom(ClipboardFormat: TClipboardFormat): boolean; virtual;
     { Determines if the object can read from the specified data object }
     function HasValidFormats(const ADataObject: IDataObject): boolean; virtual;
     { Determines if the object can read the specified format }
@@ -1303,30 +1306,48 @@ end;
 function TCustomDataFormat.GetData(DataObject: IDataObject): boolean;
 var
   i: integer;
+  ClipboardFormat: TClipboardFormat;
 begin
   Result := False;
-  i := 0;
   // Get data from each of our associated clipboard formats until we don't
   // need anymore data.
-  while (NeedsData) and (i < CompatibleFormats.Count) do
+  for i := 0 to CompatibleFormats.Count - 1 do
   begin
-    CompatibleFormats[i].Clear;
+    // Do we need data?
+    if (not NeedsData) then
+      break;
 
-    if (CompatibleFormats[i].GetData(DataObject)) then
-      if (CompatibleFormats[i].HasData) then
-      begin
-        if (Assign(CompatibleFormats[i])) then
-        begin
-          // Once data has been sucessfully transfered to the TDataFormat object,
-          // we clear the data in the TClipboardFormat object in order to conserve
-          // resources.
-          CompatibleFormats[i].Clear;
-          Result := True;
-        end;
-      end;
+    ClipboardFormat := CompatibleFormats[i];
 
-    inc(i);
+    // We still need data, but do we need it from this particular clipboard
+    // format?
+    if (not NeedDataFrom(ClipboardFormat)) then
+      continue;
+
+    ClipboardFormat.Clear;
+
+    // Get data from the data source
+    if (not ClipboardFormat.GetData(DataObject)) then
+      continue;
+
+    // We were able to read from the data source but did we get any actual data?
+    if (not ClipboardFormat.HasData) then
+      continue;
+
+    // Copy/transform the data from the clipboard format to the data format
+    if (Assign(ClipboardFormat)) then
+      Result := True;
+
+    // Once data has been sucessfully transfered to the TDataFormat object
+    // (or not), we clear the data in the TClipboardFormat object in order
+    // to conserve resources.
+    ClipboardFormat.Clear;
   end;
+end;
+
+function TCustomDataFormat.NeedDataFrom(ClipboardFormat: TClipboardFormat): boolean;
+begin
+  Result := True;
 end;
 
 function TCustomDataFormat.NeedsData: boolean;

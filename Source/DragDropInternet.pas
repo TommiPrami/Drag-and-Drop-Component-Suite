@@ -200,6 +200,7 @@ type
     procedure Clear; override;
     function HasData: boolean; override;
     function NeedsData: boolean; override;
+    function NeedDataFrom(ClipboardFormat: TClipboardFormat): boolean; override;
 
     property URL: AnsiString read FURL write SetURL;
     property Title: UnicodeString read FTitle write SetTitle;
@@ -1086,11 +1087,6 @@ begin
   *)
   if (Source is TFileContentsClipboardFormat) then
   begin
-    // Reject file contents unless we have already accepted the file group
-    // descriptor (i.e. the internet shortcut file name).
-    // We do this to prevent the situation where we has to pull a lot of data
-    // from the source and then discard the data because it didn't actually
-    // contain anything usefull (e.g. 10Mb of data from the AsyncSource demo).
     if (FURL = '') and (FTitle <> '') then
     begin
       sAnsi := TFileContentsClipboardFormat(Source).Data;
@@ -1229,6 +1225,22 @@ end;
 function TURLDataFormat.HasData: boolean;
 begin
   Result := (URL <> '') or (Title <> '');
+end;
+
+function TURLDataFormat.NeedDataFrom(ClipboardFormat: TClipboardFormat): boolean;
+begin
+  // Reject file contents unless we have already accepted the file group
+  // descriptor (i.e. the internet shortcut file name).
+  // We do this to prevent the situation where we have to pull a lot of data
+  // from the source and then discard the data because it didn't actually
+  // contain anything usefull (e.g. 10Mb of data from the AsyncSource demo).
+  //
+  // The RegisterDataConversion priorities ensures that we will read the
+  // the file group descriptor before the file contents.
+  if (ClipboardFormat is TFileContentsClipboardFormat) then
+    Result := (FTitle <> '')
+  else
+    Result := inherited;
 end;
 
 function TURLDataFormat.NeedsData: boolean;
