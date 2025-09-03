@@ -168,7 +168,9 @@ begin
   Res := DataObject.GetData(AFormatEtc, Medium);
 
   // Retry with lindex=0 if lindex=-1 failed
-  if (Res = DV_E_LINDEX) and (AFormatEtc.lindex = -1) then
+  // Windows Explorer returns DV_E_LINDEX when lindex=-1 with CF_FILECONTENTS
+  // Windows Explorer CompressedFolder namespace (e.g. Zip) returns E_INVALIDARG when lindex=-1 with CF_FILECONTENTS
+  if ((Res = DV_E_LINDEX) or (Res = E_INVALIDARG)) and (AFormatEtc.lindex = -1) then
   begin
     RetryFormatEtc := AFormatEtc;
     RetryFormatEtc.lindex := 0;
@@ -379,7 +381,7 @@ begin
     Res := FDataObject.GetData(FormatEtc, Medium);
 
     // Retry with lindex=0 if lindex=-1 failed
-    if (Res = DV_E_LINDEX) and (FormatEtc.lindex = -1) then
+    if ((Res = DV_E_LINDEX) or (Res = E_INVALIDARG)) and (FormatEtc.lindex = -1) then
     begin
       RetryFormatEtc := AFormatEtc;
       RetryFormatEtc.lindex := 0;
