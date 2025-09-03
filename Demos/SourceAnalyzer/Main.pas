@@ -90,8 +90,8 @@ type
     procedure OnDrop(Sender: TObject; ShiftState: TShiftState;
       APoint: TPoint; var Effect: Longint);
     function DataToHexDump(const Data: AnsiString): string;
-    function GetDataSize(const FormatEtc: TFormatEtc): integer;
-    function VerifyMedia(var FormatEtc: TFormatEtc): longInt;
+    function GetDataSize(const AFormatEtc: TFormatEtc): integer;
+    function VerifyMedia(var AFormatEtc: TFormatEtc): longInt;
     procedure OnDragOver(Sender: TObject; ShiftState: TShiftState;
       APoint: TPoint; var Effect: Integer);
     procedure OnDragEnter(Sender: TObject; ShiftState: TShiftState;
@@ -158,12 +158,24 @@ begin
   Init;
 end;
 
-function TFormMain.GetDataSize(const FormatEtc: TFormatEtc): integer;
+function TFormMain.GetDataSize(const AFormatEtc: TFormatEtc): integer;
 var
   Medium: TStgMedium;
+  RetryFormatEtc: TFormatEtc;
+  Res: HRESULT;
 begin
   FillChar(Medium, SizeOf(Medium), 0);
-  if (Succeeded(DataObject.GetData(FormatEtc, Medium))) then
+  Res := DataObject.GetData(AFormatEtc, Medium);
+
+  // Retry with lindex=0 if lindex=-1 failed
+  if (Res = DV_E_LINDEX) and (AFormatEtc.lindex = -1) then
+  begin
+    RetryFormatEtc := AFormatEtc;
+    RetryFormatEtc.lindex := 0;
+    Res := DataObject.GetData(RetryFormatEtc, Medium);
+  end;
+
+  if (Succeeded(Res)) then
   begin
     try
       Result := GetMediumDataSize(Medium);
@@ -346,23 +358,36 @@ begin
   *)
 end;
 
-function TFormMain.VerifyMedia(var FormatEtc: TFormatEtc): longInt;
+function TFormMain.VerifyMedia(var AFormatEtc: TFormatEtc): longInt;
 var
   Mask: longInt;
-  AFormatEtc: TFormatEtc;
+  FormatEtc: TFormatEtc;
+  RetryFormatEtc: TFormatEtc;
   Medium: TStgMedium;
+  Res: HRESULT;
 begin
   // Some drop sources lie about which media they support (e.g. Mozilla Thunderbird).
   // Here we try them all through IDataObject.GetData.
   Mask := $0000001;
-  AFormatEtc := FormatEtc;
+  FormatEtc := AFormatEtc;
   Result := 0;
   while (Mask <> 0) and (Mask <= TYMED_ENHMF) do
   begin
-    AFormatEtc.tymed := Mask;
+    FormatEtc.tymed := Mask;
     FillChar(Medium, SizeOf(Medium), 0);
-    //if (Succeeded(FDataObject.QueryGetData(AFormatEtc))) then
-    if (Succeeded(FDataObject.GetData(AFormatEtc, Medium))) then
+
+    Res := FDataObject.GetData(FormatEtc, Medium);
+
+    // Retry with lindex=0 if lindex=-1 failed
+    if (Res = DV_E_LINDEX) and (FormatEtc.lindex = -1) then
+    begin
+      RetryFormatEtc := AFormatEtc;
+      RetryFormatEtc.lindex := 0;
+      Res := DataObject.GetData(RetryFormatEtc, Medium);
+    end;
+
+    //if (Succeeded(FDataObject.QueryGetData(FormatEtc))) then
+    if (Succeeded(Res)) then
     begin
       // Mozilla Thunderbird speciality:
       // If we ask Thunderbird for FileContents on a TYMED_HGLOBAL then it
@@ -664,17 +689,11 @@ begin
 end;
 
 function TFormMain.GetDropData(var DropData: TDropData): AnsiString;
-var
-  ClipFormat: TRawClipboardFormat;
-  FormatEtc: TFormatEtc;
-begin
-  if (not DropData.HasFetched) then
+
+  function DoGetDropData(const FormatEtc: TFormatEtc): boolean;
+  var
+    ClipFormat: TRawClipboardFormat;
   begin
-    DropData.HasFetched := True;
-    // We have to ask for both the reported media and the actual media in
-    // order to work with Mozilla Thunderbird 3rc2.
-    FormatEtc := DropData.FormatEtc;
-    FormatEtc.tymed := FormatEtc.tymed or DropData.ActualTymed;
     // Create a temporary clipboard format object to retrieve the raw data
     // from the drop source.
     ClipFormat := TRawClipboardFormat.CreateFormatEtc(FormatEtc);
@@ -687,11 +706,34 @@ begin
       begin
         DropData.HasData := True;
         DropData.Data := Copy(ClipFormat.AsString, 1, MAX_DATA);
-      end;
+
+        Result := True;
+      end else
+        Result := False;
     finally
       ClipFormat.Free;
     end;
   end;
+
+var
+  FormatEtc: TFormatEtc;
+begin
+  if (not DropData.HasFetched) then
+  begin
+    DropData.HasFetched := True;
+    // We have to ask for both the reported media and the actual media in
+    // order to work with Mozilla Thunderbird 3rc2.
+    FormatEtc := DropData.FormatEtc;
+    FormatEtc.tymed := FormatEtc.tymed or DropData.ActualTymed;
+
+    if (not DoGetDropData(FormatEtc)) and (FormatEtc.lindex = -1) then
+    begin
+      // Retry with FormatEtc.lindex=0 if FormatEtc.lindex=-1 failed
+      FormatEtc.lindex := 0;
+      DoGetDropData(FormatEtc);
+    end;
+  end;
+
   Result := DropData.Data;
 end;
 
