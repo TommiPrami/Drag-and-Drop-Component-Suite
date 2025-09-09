@@ -8,8 +8,11 @@ uses
   System.SysUtils, System.ImageList, System.Actions, System.Classes,
   WinApi.ActiveX, WinApi.Windows, WinApi.Messages,
   Vcl.ActnList, Vcl.ComCtrls, Vcl.ToolWin, Vcl.Graphics, Vcl.ExtCtrls, Vcl.StdCtrls,
-  Vcl.Menus, Vcl.Dialogs, Vcl.ImgList, Vcl.Controls, Vcl.Forms,
+  Vcl.Menus, Vcl.Dialogs, Vcl.ImgList, Vcl.Controls, Vcl.Forms, Vcl.Imaging.pngimage,
   DragDrop, DropTarget;
+
+const
+  MSG_ASYNC_DROP = WM_USER;
 
 const
   MAX_DATA = 32768; // Max bytes to render in preview
@@ -28,6 +31,7 @@ type
     Data: AnsiString;
     HasFetched: boolean;
     HasData: boolean;
+    IsPending: boolean;
   end;
   PDropData = ^TDropData;
 
@@ -40,23 +44,13 @@ type
     ActionList1: TActionList;
     ActionClear: TAction;
     ActionPaste: TAction;
-    ImageList1: TImageList;
-    ToolBar1: TToolBar;
-    ToolButton1: TToolButton;
-    ToolButton2: TToolButton;
+    ImageListMain: TImageList;
     ActionSave: TAction;
-    ToolButton3: TToolButton;
     SaveDialog1: TSaveDialog;
-    ButtonDirection: TToolButton;
-    PopupMenuDirection: TPopupMenu;
     ActionDirTarget: TAction;
     ActionDirSource: TAction;
-    otarget1: TMenuItem;
-    osource1: TMenuItem;
-    ActionDir: TAction;
     IntroView: TRichEdit;
     ActionPrefetch: TAction;
-    ToolButton4: TToolButton;
     PanelError: TPanel;
     PanelErrorInner: TPanel;
     Panel3: TPanel;
@@ -64,7 +58,17 @@ type
     LabelError: TLabel;
     Panel4: TPanel;
     Image1: TImage;
-    ImageList2: TImageList;
+    ImageListStatus: TImageList;
+    PanelButtons: TPanel;
+    ButtonClear: TButton;
+    ButtonPaste: TButton;
+    ButtonSave: TButton;
+    CheckBoxPrefetch: TCheckBox;
+    GroupBoxDirection: TGroupBox;
+    RadioButtonDirectionTarget: TRadioButton;
+    RadioButtonDirectionSource: TRadioButton;
+    CheckBoxAsync: TCheckBox;
+    ActionAsync: TAction;
     procedure FormCreate(Sender: TObject);
     procedure ListViewDataFormatsDeletion(Sender: TObject;
       Item: TListItem);
@@ -76,10 +80,6 @@ type
     procedure ActionPasteExecute(Sender: TObject);
     procedure ActionSaveExecute(Sender: TObject);
     procedure ActionSaveUpdate(Sender: TObject);
-    procedure ActionDirTargetExecute(Sender: TObject);
-    procedure ActionDirSourceExecute(Sender: TObject);
-    procedure ActionDirExecute(Sender: TObject);
-    procedure ActionPrefetchExecute(Sender: TObject);
     procedure ListViewDataFormatsAdvancedCustomDrawSubItem(
       Sender: TCustomListView; Item: TListItem; SubItem: Integer;
       State: TCustomDrawState; Stage: TCustomDrawStage;
@@ -87,22 +87,30 @@ type
   private
     FDataObject: IDataObject;
     FDropTarget: TCustomDropTarget;
+    FAsyncPending: integer;
     procedure OnDrop(Sender: TObject; ShiftState: TShiftState;
       APoint: TPoint; var Effect: Longint);
-    function DataToHexDump(const Data: AnsiString): string;
-    function GetDataSize(const AFormatEtc: TFormatEtc): integer;
-    function VerifyMedia(var AFormatEtc: TFormatEtc): longInt;
     procedure OnDragOver(Sender: TObject; ShiftState: TShiftState;
       APoint: TPoint; var Effect: Integer);
     procedure OnDragEnter(Sender: TObject; ShiftState: TShiftState;
       APoint: TPoint; var Effect: Integer);
     procedure OnDragLeave(Sender: TObject);
-  protected
+    procedure OnAsyncThreadTerminate(Sender: TObject);
+    procedure OnAsyncDrop(Sender: TObject);
+  private
+    procedure MsgAsyncDrop(var Msg: TMessage); message MSG_ASYNC_DROP;
+  private
+    function DataToHexDump(const Data: AnsiString): string;
+    function GetDataSize(const AFormatEtc: TFormatEtc): integer;
+    function VerifyMedia(var AFormatEtc: TFormatEtc): longInt;
+    procedure CheckAsyncPending;
     procedure LoadRTF(const s: string);
     procedure Error(const Msg: string);
     procedure Init;
     procedure Clear;
-    function GetDropData(var DropData: TDropData): AnsiString;
+    procedure Reset;
+    function PrefetchDropData(var DropData: TDropData): boolean; // Returns False if data is pending
+    function GetDropDataAsString(var DropData: TDropData): AnsiString;
     property DataObject: IDataObject read FDataObject;
   public
   end;
@@ -116,13 +124,151 @@ implementation
 
 uses
   WinApi.CommCtrl,
+  Win.ComObj,
   DragDropFormats;
 
 resourcestring
   sIntro = '{\rtf1\ansi\ansicpg1252\deff0\deflang1030{\fonttbl{\f0\fswiss\fcharset0 Arial;}{\f1\fnil\fcharset2 Symbol;}}'+#13+
     '\viewkind4\uc1\pard{\pntext\f1\''B7\tab}{\*\pn\pnlvlblt\pnf1\pnindent0{\pntxtb\''B7}}\fi-284\li284\f0\fs20Drag data from any application and drop it on this window.\line'+#13+
-    'The data formats supported by the drop source will be displayed in the list above.\par '+#13+
-    '{\pntext\f1\''B7\tab}Select a data format from the list to display its content here.\par }';
+    'The clipboard formats supported by the drop source will be displayed in the list above.\par '+#13+
+    '{\pntext\f1\''B7\tab}Select a clipboard format from the list to display its content here.\par }';
+
+const
+  ImageIndexWarning = 0;
+  ImageIndexPending = 1;
+
+function GetDropData(const ADataObject: IDataObject; const AFormatEtc: TFormatEtc; var ADropData: TDropData): boolean;
+var
+  ClipFormat: TRawClipboardFormat;
+begin
+  // Create a temporary clipboard format object to retrieve the raw data
+  // from the drop source.
+  ClipFormat := TRawClipboardFormat.CreateFormatEtc(AFormatEtc);
+  try
+    // Note: It would probably be better (more efficient & safer) if we used a
+    // custom clipboard format class which only copied a limited amount of data
+    // from the source data object. However, I'm lazy and this solution works
+    // fine most of the time.
+    if (ClipFormat.GetData(ADataObject)) then
+    begin
+      ADropData.Data := Copy(ClipFormat.AsString, 1, MAX_DATA);
+      ADropData.HasData := True;
+
+      Result := True;
+    end else
+      Result := False;
+  finally
+    ClipFormat.Free;
+  end;
+end;
+
+{ TAsyncOperationThread }
+
+type
+  TAsyncOperationThread = class(TThread)
+  private
+    FDataObject: IDataObject;
+    FDropData: PDropData;
+    FFormatEtc: TFormatEtc;
+
+    FDataObjectStream: pointer;
+    FAsyncOperationStream: pointer;
+
+    FOnDrop: TNotifyEvent;
+  protected
+    procedure Execute; override;
+
+    property DataObjectStream: pointer read FDataObjectStream;
+    property AsyncOperationStream: pointer read FAsyncOperationStream;
+  public
+    constructor Create(const ADataObject: IDataObject; ADropData: PDropData; const AFormatEtc: TFormatEtc);
+    destructor Destroy; override;
+
+    property DropData: PDropData read FDropData;
+    property OnDrop: TNotifyEvent read FOnDrop write FOnDrop;
+  end;
+
+constructor TAsyncOperationThread.Create(const ADataObject: IDataObject; ADropData: PDropData; const AFormatEtc: TFormatEtc);
+begin
+  inherited Create(True);
+  FreeOnTerminate := True;
+
+  FDataObject := ADataObject; // Keeps data object alive until we're done with it
+
+  FDropData := ADropData;
+  FFormatEtc := AFormatEtc;
+
+  FDropData.IsPending := True;
+
+  OleCheck(CoMarshalInterThreadInterfaceInStream(IDataObject, FDataObject, IStream(FDataObjectStream)));
+  OleCheck(CoMarshalInterThreadInterfaceInStream(IAsyncOperation2, FDataObject, IStream(FAsyncOperationStream)));
+end;
+
+destructor TAsyncOperationThread.Destroy;
+begin
+  FDataObjectStream := nil;
+  FAsyncOperationStream := nil;
+  FDataObject := nil;
+  inherited Destroy;
+end;
+
+procedure TAsyncOperationThread.Execute;
+var
+  DataObject: IDataObject;
+
+  function DoGetDropData: boolean;
+  begin
+    // Get data from the drop source using the marshalled data object
+    if (GetDropData(DataObject, FFormatEtc, FDropData^)) then
+    begin
+      // Generate an OnDrop event
+      // Note that this event is executed in the context of this thread and thus
+      // must adhere to the rules of thread safe use of the VCL (e.g. don't
+      // update visual stuff directly).
+      if (Assigned(FOnDrop)) then
+        FOnDrop(Self);
+
+      Result := True;
+    end else
+      Result := False;
+  end;
+
+var
+  Res: HResult;
+  AsyncOperation: IAsyncOperation2;
+begin
+  CoInitialize(nil);
+  try
+    try
+      OleCheck(CoGetInterfaceAndReleaseStream(IStream(DataObjectStream), IDataObject, DataObject));
+      OleCheck(CoGetInterfaceAndReleaseStream(IStream(AsyncOperationStream), IAsyncOperation, AsyncOperation));
+
+      // Retry with lindex=0 if lindex=-1 failed
+      if (not DoGetDropData) and (FFormatEtc.lindex = -1) then
+      begin
+        FFormatEtc.lindex := 0;
+        DoGetDropData;
+      end;
+
+      Res := S_OK;
+    except
+      on E: EOleSysError do
+        Res := E.ErrorCode
+      else
+        Res := E_UNEXPECTED;
+    end;
+
+    // Notify drop source that we are done
+    AsyncOperation.EndOperation(Res, nil, DROPEFFECT_NONE);
+
+    FDropData.IsPending := False;
+
+  finally
+    DataObject := nil;
+    AsyncOperation := nil;
+    CoUninitialize;
+  end;
+end;
 
 { TOmnipotentDropTarget }
 
@@ -186,6 +332,17 @@ begin
     end;
   end else
     Result := -1;
+end;
+
+procedure TFormMain.OnAsyncDrop(Sender: TObject);
+begin
+  // Post message to have event handled in main thread
+  PostMessage(Handle, MSG_ASYNC_DROP, WPARAM(TAsyncOperationThread(Sender).DropData), 0);
+end;
+
+procedure TFormMain.OnAsyncThreadTerminate(Sender: TObject);
+begin
+  InterlockedDecrement(FAsyncPending);
 end;
 
 procedure TFormMain.OnDragEnter(Sender: TObject; ShiftState: TShiftState;
@@ -299,7 +456,6 @@ begin
     begin
       Item := ListViewDataFormats.Items.Add;
       Item.ImageIndex := -1;
-      Item.ImageIndex := -1;
 
       // Format ID
       Item.Caption := IntToStr(SourceFormatEtc.cfFormat);
@@ -325,32 +481,36 @@ begin
       New(DropData);
       Item.Data := DropData;
 
-      DropData.Data := '';
-      DropData.HasFetched := False;
-      DropData.HasData := False;
+      DropData^ := Default(TDropData);
       DropData.FormatEtc := SourceFormatEtc;
-      DropData.ActualTymed := 0;
 
       // Verify media
       DropData.ActualTymed := VerifyMedia(DropData.FormatEtc);
       if (DropData.ActualTymed <> DropData.FormatEtc.tymed) then
-        Item.ImageIndex := 0;
+        Item.ImageIndex := ImageIndexWarning;
 
       if (ActionPrefetch.Checked) then
-        GetDropData(DropData^);
+      begin
+        if PrefetchDropData(DropData^) then
+          Item.ImageIndex := ImageIndexPending;
+      end;
     end;
   finally
     ListViewDataFormats.Items.EndUpdate;
   end;
+
+  // Force resize of listview to get rid of horizontal scrollbar
+  ListViewDataFormats.Width := ListViewDataFormats.Width - 1;
 
   // Reject the drop so the drop source doesn't think we actually did something
   // usefull with it.
   // This is important when moving data or when dropping from the recycle bin;
   // If we do not reject the drop, the source will assume that it is safe to
   // delete the source data. See also "Optimized move".
+
   // Note: The code below has been disabled as we now handle the above scenario
   // as an optimized move (OptimizedMove has been set to True) and break our
-  // part (that is, the drop target's) of the optmized move contract by not
+  // (that is, the drop target's) part of the optmized move contract by not
   // actually deleting the dropped data.
   (*
   if ((Effect and not(DROPEFFECT_SCROLL)) = DROPEFFECT_MOVE) then
@@ -405,38 +565,18 @@ end;
 
 procedure TFormMain.ActionClearExecute(Sender: TObject);
 begin
-  Clear;
-  Init;
-end;
-
-procedure TFormMain.ActionDirExecute(Sender: TObject);
-begin
-  ButtonDirection.CheckMenuDropdown;
-end;
-
-procedure TFormMain.ActionDirSourceExecute(Sender: TObject);
-begin
-  ActionDir.ImageIndex := TAction(Sender).ImageIndex;
-end;
-
-procedure TFormMain.ActionDirTargetExecute(Sender: TObject);
-begin
-  ActionDir.ImageIndex := TAction(Sender).ImageIndex;
+  Reset;
 end;
 
 procedure TFormMain.ActionPasteExecute(Sender: TObject);
 begin
+  CheckAsyncPending;
   FDropTarget.PasteFromClipboard;
 end;
 
 procedure TFormMain.ActionPasteUpdate(Sender: TObject);
 begin
   TAction(Sender).Enabled := (FDropTarget.CanPasteFromClipboard);
-end;
-
-procedure TFormMain.ActionPrefetchExecute(Sender: TObject);
-begin
-//
 end;
 
 procedure TFormMain.ActionSaveExecute(Sender: TObject);
@@ -459,37 +599,39 @@ const
   sSeparator =  '============================================================================';
   sActualMedia = ' (actual: %s)';
 begin
-  if (SaveDialog1.Execute) then
-  begin
-    Strings := TStringList.Create;
-    try
-      for i := 0 to ListViewDataFormats.Items.Count-1 do
-        if (ListViewDataFormats.Items[i].Data <> nil) then
-        begin
-          DropData := PDropData(ListViewDataFormats.Items[i].Data);
-          ClipFormat := TRawClipboardFormat.CreateFormatEtc(DropData.FormatEtc);
-          try
-            ClipFormat.GetData(DataObject);
-            Media := MediaToString(DropData.FormatEtc.tymed);
-            if (DropData.FormatEtc.tymed <> DropData.ActualTymed) then
-              Media := Media + Format(sActualMedia, [MediaToString(DropData.ActualTymed)]);
-            Strings.Add(Format(sFormat,
-              [ClipFormat.ClipboardFormatName, ClipFormat.ClipboardFormat,
-              Media,
-              AspectsToString(DropData.FormatEtc.dwAspect),
-              DropData.FormatEtc.lindex,
-              ListViewDataFormats.Items[i].SubItems[3]]));
-            Strings.Add(sDataHeader);
-            Strings.Add(DataToHexDump(GetDropData(DropData^)));
-            Strings.Add(sSeparator);
-          finally
-            ClipFormat.Free;
-          end;
-      end;
-      Strings.SaveToFile(SaveDialog1.FileName);
-    finally
-      Strings.Free;
+  CheckAsyncPending;
+
+  if (not SaveDialog1.Execute) then
+    exit;
+
+  Strings := TStringList.Create;
+  try
+    for i := 0 to ListViewDataFormats.Items.Count-1 do
+      if (ListViewDataFormats.Items[i].Data <> nil) then
+      begin
+        DropData := PDropData(ListViewDataFormats.Items[i].Data);
+        ClipFormat := TRawClipboardFormat.CreateFormatEtc(DropData.FormatEtc);
+        try
+          ClipFormat.GetData(DataObject);
+          Media := MediaToString(DropData.FormatEtc.tymed);
+          if (DropData.FormatEtc.tymed <> DropData.ActualTymed) then
+            Media := Media + Format(sActualMedia, [MediaToString(DropData.ActualTymed)]);
+          Strings.Add(Format(sFormat,
+            [ClipFormat.ClipboardFormatName, ClipFormat.ClipboardFormat,
+            Media,
+            AspectsToString(DropData.FormatEtc.dwAspect),
+            DropData.FormatEtc.lindex,
+            ListViewDataFormats.Items[i].SubItems[3]]));
+          Strings.Add(sDataHeader);
+          Strings.Add(DataToHexDump(GetDropDataAsString(DropData^)));
+          Strings.Add(sSeparator);
+        finally
+          ClipFormat.Free;
+        end;
     end;
+    Strings.SaveToFile(SaveDialog1.FileName);
+  finally
+    Strings.Free;
   end;
 end;
 
@@ -498,11 +640,27 @@ begin
   TAction(Sender).Enabled := (ListViewDataFormats.Items.Count > 0);
 end;
 
+procedure TFormMain.CheckAsyncPending;
+begin
+  if (FAsyncPending > 0) then
+  begin
+    ShowMessage('Async transfer in progress.'#13'Please wait for transfer to complete');
+    Abort;
+  end;
+end;
+
 procedure TFormMain.Clear;
 begin
   EditHexView.Text := '';
   ListViewDataFormats.Items.Clear;
   FDataObject := nil;
+end;
+
+procedure TFormMain.Reset;
+begin
+  CheckAsyncPending;
+  Clear;
+  Init;
 end;
 
 function TFormMain.DataToHexDump(const Data: AnsiString): string;
@@ -561,91 +719,85 @@ var
   s: string;
   Canvas: TControlCanvas;
 begin
-  if (SubItem = 3) and (Stage = cdPrePaint) and
-    (PDropData(Item.Data).FormatEtc.tymed <> PDropData(Item.Data).ActualTymed) then
-  begin
-    // Draw media names:
-    // - Black: Reported by EnumFormatEtc and supported by GetData.
-    // - Red: Reported by EnumFormatEtc but not supported by GetData.
-    // - Green: Not reported by EnumFormatEtc but supported by GetData.
-    ListView_GetSubItemRect(Sender.Handle, Item.Index, SubItem, LVIR_BOUNDS, @TextRect);
-
-    // Work around for long standing bug in TListView ownerdraw:
-    // Because ListView.Canvas.Font.OnChange is rerouted by the listview,
-    // changes to the font does not update the GDI object. Same goes for the
-    // brush.
-    Canvas := TControlCanvas.Create;
-    try
-      Canvas.Control := Sender;
-
-      Canvas.Font.Assign(Sender.Canvas.Font);
-      Canvas.Brush.Assign(Sender.Canvas.Brush);
-
-      if Item.Selected then
+  case SubItem of
+    3:
+      if (Stage = cdPrePaint) and
+        (PDropData(Item.Data).FormatEtc.tymed <> PDropData(Item.Data).ActualTymed) then
       begin
-        if Sender.Focused then
-          Canvas.Brush.Color := clHighlight
-        else
-          Canvas.Brush.Color := clBtnFace;
-      end else
-        Canvas.Brush.Color := clWindow;
-      Canvas.Brush.Style := bsSolid;
+        // Draw media names:
+        // - Black: Reported by EnumFormatEtc and supported by GetData.
+        // - Red: Reported by EnumFormatEtc but not supported by GetData.
+        // - Green: Not reported by EnumFormatEtc but supported by GetData.
+        ListView_GetSubItemRect(Sender.Handle, Item.Index, SubItem, LVIR_BOUNDS, @TextRect);
 
-      Canvas.FillRect(TextRect);
+        // Work around for long standing bug in TListView ownerdraw:
+        // Because ListView.Canvas.Font.OnChange is rerouted by the listview,
+        // changes to the font does not update the GDI object. Same goes for the
+        // brush.
+        Canvas := TControlCanvas.Create;
+        try
+          Canvas.Control := Sender;
 
-      InflateRect(TextRect, -1, -1);
-      inc(TextRect.Left, 5);
+          Canvas.Font.Assign(Sender.Canvas.Font);
+          Canvas.Brush.Assign(Sender.Canvas.Brush);
 
-      Mask := $0001;
-      Tymed := PDropData(Item.Data).FormatEtc.tymed or PDropData(Item.Data).ActualTymed;
-      while (Mask <= Tymed) do
-      begin
-        if ((Tymed and Mask) <> 0) then
-        begin
-          if ((PDropData(Item.Data).ActualTymed and Mask) = 0) then
+          if Item.Selected then
           begin
-            Canvas.Font.Color := clRed;
-            Canvas.Font.Style := [fsStrikeOut];
-          end else
-          if ((PDropData(Item.Data).FormatEtc.tymed and Mask) = 0) then
-          begin
-            Canvas.Font.Color := clGreen;
-            Canvas.Font.Style := [];
-          end else
-          begin
-            if Item.Selected and Sender.Focused then
-              Canvas.Brush.Color := clHighlightText
+            if Sender.Focused then
+              Canvas.Brush.Color := clHighlight
             else
-              Canvas.Font.Color := clWindowText;
-            Canvas.Font.Style := [];
+              Canvas.Brush.Color := clBtnFace;
+          end else
+            Canvas.Brush.Color := clWindow;
+          Canvas.Brush.Style := bsSolid;
+
+          Canvas.FillRect(TextRect);
+
+          InflateRect(TextRect, -1, -1);
+          inc(TextRect.Left, 5);
+
+          Mask := $0001;
+          Tymed := PDropData(Item.Data).FormatEtc.tymed or PDropData(Item.Data).ActualTymed;
+          while (Mask <= Tymed) do
+          begin
+            if ((Tymed and Mask) <> 0) then
+            begin
+              if ((PDropData(Item.Data).ActualTymed and Mask) = 0) then
+              begin
+                Canvas.Font.Color := clRed;
+                Canvas.Font.Style := [fsStrikeOut];
+              end else
+              if ((PDropData(Item.Data).FormatEtc.tymed and Mask) = 0) then
+              begin
+                Canvas.Font.Color := clGreen;
+                Canvas.Font.Style := [];
+              end else
+              begin
+                if Item.Selected and Sender.Focused then
+                  Canvas.Brush.Color := clHighlightText
+                else
+                  Canvas.Font.Color := clWindowText;
+                Canvas.Font.Style := [];
+              end;
+
+              s := MediaToString(Mask) + ' ';
+
+              r := TextRect;
+
+              DrawText(Canvas.Handle, PChar(s), Length(s), r, DT_CALCRECT or DT_LEFT or DT_NOPREFIX or DT_SINGLELINE or DT_VCENTER);
+              IntersectRect(r, r, TextRect);
+              TextRect.Left := r.Right;
+              DrawText(Canvas.Handle, PChar(s), Length(s)-1, r, DT_LEFT or DT_NOPREFIX or DT_SINGLELINE or DT_VCENTER);
+            end;
+
+            Mask := Mask shl 1;
           end;
-
-          s := MediaToString(Mask) + ' ';
-
-          r := TextRect;
-
-          DrawText(Canvas.Handle, PChar(s), Length(s), r, DT_CALCRECT or DT_LEFT or DT_NOPREFIX or DT_SINGLELINE or DT_VCENTER);
-          IntersectRect(r, r, TextRect);
-          TextRect.Left := r.Right;
-          DrawText(Canvas.Handle, PChar(s), Length(s)-1, r, DT_LEFT or DT_NOPREFIX or DT_SINGLELINE or DT_VCENTER);
+        finally
+          Canvas.Free;
         end;
 
-        Mask := Mask shl 1;
+        DefaultDraw := False;
       end;
-    finally
-      Canvas.Free;
-    end;
-
-    DefaultDraw := False;
-(*
-  end else
-  begin
-    // Work around for "bold font" after custom draw
-    SaveColor := TListView(Sender).Canvas.Brush.Color;
-    TListView(Sender).Canvas.Brush.Color := clNone;
-    TListView(Sender).Canvas.Brush.Color := SaveColor;
-    DefaultDraw := True;
-*)
   end;
 end;
 
@@ -677,11 +829,27 @@ begin
   begin
     DropData := PDropData(Item.Data);
     try
-      EditHexView.Text := DataToHexDump(GetDropData(DropData^));
-      if (DropData.HasData) then
-        EditHexView.Show
-      else
-        Error('Failed to retrieve data from Drop Source');
+      if (not DropData.IsPending) and (PrefetchDropData(DropData^)) then
+      begin
+        // We just initiated an async transfer; Let user know
+        Item.ImageIndex := ImageIndexPending;
+        ListViewDataFormats.Update;
+      end;
+
+      if (not DropData.IsPending) then
+      begin
+        EditHexView.Text := DataToHexDump(GetDropDataAsString(DropData^));
+
+        if (DropData.HasData) then
+          EditHexView.Show
+        else
+          Error('Failed to retrieve data from Drop Source');
+      end else
+      begin
+        EditHexView.Text := 'Async transfer in progress - Please wait';
+        EditHexView.Show;
+        EditHexView.Update;
+      end;
     except
       on E: Exception do
         Error(E.Message);
@@ -690,36 +858,63 @@ begin
     EditHexView.Hide;
 end;
 
-function TFormMain.GetDropData(var DropData: TDropData): AnsiString;
+function TFormMain.PrefetchDropData(var DropData: TDropData): boolean;
+var
+  IsAsync: boolean;
 
   function DoGetDropData(const FormatEtc: TFormatEtc): boolean;
   var
-    ClipFormat: TRawClipboardFormat;
+    AsyncOperation: IAsyncOperation2;
+    DoAsync: Bool;
+    Thread: TAsyncOperationThread;
   begin
-    // Create a temporary clipboard format object to retrieve the raw data
-    // from the drop source.
-    ClipFormat := TRawClipboardFormat.CreateFormatEtc(FormatEtc);
-    try
-      // Note: It would probably be better (more efficient & safer) if we used a
-      // custom clipboard format class which only copied a limited amount of data
-      // from the source data object. However, I'm lazy and this solution works
-      // fine most of the time.
-      if (ClipFormat.GetData(DataObject)) then
-      begin
-        DropData.HasData := True;
-        DropData.Data := Copy(ClipFormat.AsString, 1, MAX_DATA);
+    // Query source for async mode if requested
+    if (not ActionAsync.Checked) or
+      (not Supports(DataObject, IAsyncOperation2, AsyncOperation)) or
+      (Failed(AsyncOperation.GetAsyncMode(DoAsync))) then
+      DoAsync := False;
+
+    // Start an async data transfer.
+    if (DoAsync) and
+      // Notify drop source that an async data transfer is starting.
+      Succeeded(AsyncOperation.StartOperation(nil)) then
+    begin
+      try
+
+        // Create the data transfer thread and launch it.
+        Thread := TAsyncOperationThread.Create(DataObject, @DropData, FormatEtc);
+        try
+
+          Thread.OnTerminate := OnAsyncThreadTerminate;
+          Thread.OnDrop := OnAsyncDrop;
+
+          InterlockedIncrement(FAsyncPending);
+
+          Thread.Start;
+
+          IsAsync := True;
+
+        except
+          Thread.Free;
+        end;
 
         Result := True;
-      end else
+
+      except
+        // Notify drop source that async data transfer failed
+        AsyncOperation.EndOperation(E_UNEXPECTED, nil, DROPEFFECT_NONE);
         Result := False;
-    finally
-      ClipFormat.Free;
-    end;
+      end;
+
+    end else
+      Result := GetDropData(DataObject, FormatEtc, DropData);
   end;
 
 var
   FormatEtc: TFormatEtc;
 begin
+  IsAsync := False;
+
   if (not DropData.HasFetched) then
   begin
     DropData.HasFetched := True;
@@ -736,6 +931,12 @@ begin
     end;
   end;
 
+  Result := IsAsync;
+end;
+
+function TFormMain.GetDropDataAsString(var DropData: TDropData): AnsiString;
+begin
+  PrefetchDropData(DropData);
   Result := DropData.Data;
 end;
 
@@ -749,6 +950,24 @@ begin
   finally
     Stream.Free;
   end;
+end;
+
+procedure TFormMain.MsgAsyncDrop(var Msg: TMessage);
+var
+  DropData: PDropData;
+  i: integer;
+begin
+  DropData := PDropData(Msg.WParam);
+
+  // Find the listview node that corresponds to the DropData
+  for i := 0 to ListViewDataFormats.Items.Count-1 do
+    if (ListViewDataFormats.Items[i].Data = DropData) then
+    begin
+      if (ListViewDataFormats.Items[i].Selected) then
+        ListViewDataFormatsSelectItem(ListViewDataFormats, ListViewDataFormats.Items[i], True);
+      ListViewDataFormats.Items[i].ImageIndex := -1;
+      break;
+    end;
 end;
 
 procedure TFormMain.Init;
