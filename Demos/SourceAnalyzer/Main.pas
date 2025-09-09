@@ -9,6 +9,7 @@ uses
   WinApi.ActiveX, WinApi.Windows, WinApi.Messages,
   Vcl.ActnList, Vcl.ComCtrls, Vcl.ToolWin, Vcl.Graphics, Vcl.ExtCtrls, Vcl.StdCtrls,
   Vcl.Menus, Vcl.Dialogs, Vcl.ImgList, Vcl.Controls, Vcl.Forms, Vcl.Imaging.pngimage,
+  Vcl.Buttons,
   DragDrop, DropTarget;
 
 const
@@ -69,6 +70,11 @@ type
     RadioButtonDirectionSource: TRadioButton;
     CheckBoxAsync: TCheckBox;
     ActionAsync: TAction;
+    ButtonAsyncAvailable: TSpeedButton;
+    ActionAsyncAvailable: TAction;
+    ActionAsyncNotAvailable: TAction;
+    ActionAsyncActive: TAction;
+    ActionAsyncInfo: TAction;
     procedure FormCreate(Sender: TObject);
     procedure ListViewDataFormatsDeletion(Sender: TObject;
       Item: TListItem);
@@ -84,6 +90,7 @@ type
       Sender: TCustomListView; Item: TListItem; SubItem: Integer;
       State: TCustomDrawState; Stage: TCustomDrawStage;
       var DefaultDraw: Boolean);
+    procedure ActionDummyExecute(Sender: TObject);
   private
     FDataObject: IDataObject;
     FDropTarget: TCustomDropTarget;
@@ -97,6 +104,7 @@ type
     procedure OnDragLeave(Sender: TObject);
     procedure OnAsyncThreadTerminate(Sender: TObject);
     procedure OnAsyncDrop(Sender: TObject);
+    procedure OnAsyncDropFailed(Sender: TObject);
   private
     procedure MsgAsyncDrop(var Msg: TMessage); message MSG_ASYNC_DROP;
   private
@@ -111,6 +119,7 @@ type
     procedure Reset;
     function PrefetchDropData(var DropData: TDropData): boolean; // Returns False if data is pending
     function GetDropDataAsString(var DropData: TDropData): AnsiString;
+    procedure UpdateAsyncAbility(const DataObject: IDataObject);
     property DataObject: IDataObject read FDataObject;
   public
   end;
@@ -136,6 +145,7 @@ resourcestring
 const
   ImageIndexWarning = 0;
   ImageIndexPending = 1;
+  ImageIndexError = 2;
 
 function GetDropData(const ADataObject: IDataObject; const AFormatEtc: TFormatEtc; var ADropData: TDropData): boolean;
 var
@@ -175,6 +185,7 @@ type
     FAsyncOperationStream: pointer;
 
     FOnDrop: TNotifyEvent;
+    FOnDropFailed: TNotifyEvent;
   protected
     procedure Execute; override;
 
@@ -186,6 +197,7 @@ type
 
     property DropData: PDropData read FDropData;
     property OnDrop: TNotifyEvent read FOnDrop write FOnDrop;
+    property OnDropFailed: TNotifyEvent read FOnDropFailed write FOnDropFailed;
   end;
 
 constructor TAsyncOperationThread.Create(const ADataObject: IDataObject; ADropData: PDropData; const AFormatEtc: TFormatEtc);
@@ -233,6 +245,12 @@ var
       Result := False;
   end;
 
+  procedure DoFailed;
+  begin
+    if (Assigned(FOnDropFailed)) then
+      FOnDropFailed(Self);
+  end;
+
 var
   Res: HResult;
   AsyncOperation: IAsyncOperation2;
@@ -243,14 +261,16 @@ begin
       OleCheck(CoGetInterfaceAndReleaseStream(IStream(DataObjectStream), IDataObject, DataObject));
       OleCheck(CoGetInterfaceAndReleaseStream(IStream(AsyncOperationStream), IAsyncOperation, AsyncOperation));
 
+      Res := S_OK;
+
       // Retry with lindex=0 if lindex=-1 failed
       if (not DoGetDropData) and (FFormatEtc.lindex = -1) then
       begin
         FFormatEtc.lindex := 0;
-        DoGetDropData;
+        if (not DoGetDropData) then
+          Res := E_FAIL;
       end;
 
-      Res := S_OK;
     except
       on E: EOleSysError do
         Res := E.ErrorCode
@@ -268,6 +288,9 @@ begin
     AsyncOperation := nil;
     CoUninitialize;
   end;
+
+  if (Failed(Res)) then
+    DoFailed;
 end;
 
 { TOmnipotentDropTarget }
@@ -337,12 +360,18 @@ end;
 procedure TFormMain.OnAsyncDrop(Sender: TObject);
 begin
   // Post message to have event handled in main thread
-  PostMessage(Handle, MSG_ASYNC_DROP, WPARAM(TAsyncOperationThread(Sender).DropData), 0);
+  PostMessage(Handle, MSG_ASYNC_DROP, WPARAM(TAsyncOperationThread(Sender).DropData), Ord(True));
+end;
+
+procedure TFormMain.OnAsyncDropFailed(Sender: TObject);
+begin
+  PostMessage(Handle, MSG_ASYNC_DROP, WPARAM(TAsyncOperationThread(Sender).DropData), Ord(False));
 end;
 
 procedure TFormMain.OnAsyncThreadTerminate(Sender: TObject);
 begin
-  InterlockedDecrement(FAsyncPending);
+  if (InterlockedDecrement(FAsyncPending) = 0) then
+    ButtonAsyncAvailable.Action := ActionAsyncAvailable;
 end;
 
 procedure TFormMain.OnDragEnter(Sender: TObject; ShiftState: TShiftState;
@@ -350,6 +379,8 @@ procedure TFormMain.OnDragEnter(Sender: TObject; ShiftState: TShiftState;
 begin
   Clear;
   StatusBar1.SimpleText := 'Drag detected - Drop to analyze the drop source';
+
+  UpdateAsyncAbility(TCustomDropTarget(Sender).DataObject);
 end;
 
 procedure TFormMain.OnDragLeave(Sender: TObject);
@@ -434,6 +465,8 @@ begin
     // Save a reference to the data object for later use. We need it to fetch
     // data from the drop source when the user selects an item from the list.
     FDataObject := TCustomDropTarget(Sender).DataObject;
+
+    UpdateAsyncAbility(FDataObject);
 
     if (ActionDirTarget.Checked) then
       Direction := DATADIR_GET
@@ -563,6 +596,11 @@ begin
   end;
 end;
 
+procedure TFormMain.ActionDummyExecute(Sender: TObject);
+begin
+  // Empty on purpose
+end;
+
 procedure TFormMain.ActionClearExecute(Sender: TObject);
 begin
   Reset;
@@ -661,6 +699,17 @@ begin
   CheckAsyncPending;
   Clear;
   Init;
+end;
+
+procedure TFormMain.UpdateAsyncAbility(const DataObject: IDataObject);
+begin
+  if (DataObject = nil) then
+    ButtonAsyncAvailable.Action := ActionAsyncInfo
+  else
+  if (Supports(DataObject, IAsyncOperation2)) then
+    ButtonAsyncAvailable.Action := ActionAsyncAvailable
+  else
+    ButtonAsyncAvailable.Action := ActionAsyncNotAvailable;
 end;
 
 function TFormMain.DataToHexDump(const Data: AnsiString): string;
@@ -887,8 +936,10 @@ var
 
           Thread.OnTerminate := OnAsyncThreadTerminate;
           Thread.OnDrop := OnAsyncDrop;
+          Thread.OnDropFailed := OnAsyncDropFailed;
 
-          InterlockedIncrement(FAsyncPending);
+          if (InterlockedIncrement(FAsyncPending) = 1) then
+            ButtonAsyncAvailable.Action := ActionAsyncActive;
 
           Thread.Start;
 
@@ -955,17 +1006,24 @@ end;
 procedure TFormMain.MsgAsyncDrop(var Msg: TMessage);
 var
   DropData: PDropData;
+  Success: boolean;
   i: integer;
 begin
   DropData := PDropData(Msg.WParam);
+  Success := boolean(Msg.LParam);
 
   // Find the listview node that corresponds to the DropData
   for i := 0 to ListViewDataFormats.Items.Count-1 do
     if (ListViewDataFormats.Items[i].Data = DropData) then
     begin
-      if (ListViewDataFormats.Items[i].Selected) then
-        ListViewDataFormatsSelectItem(ListViewDataFormats, ListViewDataFormats.Items[i], True);
-      ListViewDataFormats.Items[i].ImageIndex := -1;
+      if (Success) then
+      begin
+        if (ListViewDataFormats.Items[i].Selected) then
+          ListViewDataFormatsSelectItem(ListViewDataFormats, ListViewDataFormats.Items[i], True);
+        ListViewDataFormats.Items[i].ImageIndex := -1;
+      end else
+        ListViewDataFormats.Items[i].ImageIndex := ImageIndexError;
+
       break;
     end;
 end;
@@ -975,6 +1033,7 @@ begin
   PanelError.Hide;
   EditHexView.Hide;
   IntroView.Show;
+  UpdateAsyncAbility(nil);
 end;
 
 end.
