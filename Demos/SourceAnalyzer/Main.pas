@@ -623,7 +623,7 @@ var
   i: integer;
   ClipFormat: TRawClipboardFormat;
   DropData: PDropData;
-  Media: string;
+  Name, Media: string;
 const
   sFormat =     'Name  : %s'+#13#10+
                 'ID    : %d'+#13#10+
@@ -651,15 +651,22 @@ begin
         ClipFormat := TRawClipboardFormat.CreateFormatEtc(DropData.FormatEtc);
         try
           ClipFormat.GetData(DataObject);
+
+          Name := ClipFormat.ClipboardFormatName;
+          if (Name = '') then
+            Name := GetClipboardFormatNameStr(ClipFormat.ClipboardFormat);
+
           Media := MediaToString(DropData.FormatEtc.tymed);
           if (DropData.FormatEtc.tymed <> DropData.ActualTymed) then
             Media := Media + Format(sActualMedia, [MediaToString(DropData.ActualTymed)]);
+
           Strings.Add(Format(sFormat,
-            [ClipFormat.ClipboardFormatName, ClipFormat.ClipboardFormat,
+            [Name, ClipFormat.ClipboardFormat,
             Media,
             AspectsToString(DropData.FormatEtc.dwAspect),
             DropData.FormatEtc.lindex,
             ListViewDataFormats.Items[i].SubItems[3]]));
+
           Strings.Add(sDataHeader);
           Strings.Add(DataToHexDump(GetDropDataAsString(DropData^)));
           Strings.Add(sSeparator);
