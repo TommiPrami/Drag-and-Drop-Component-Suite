@@ -1,18 +1,23 @@
 unit DragDropDesign;
+
+(*
+ * Drag and Drop Component Suite
+ *
+ * Copyright (c) Angus Johnson & Anders Melander
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ *
+ *)
+
+// -----------------------------------------------------------------------------
+//
+// Contains design-time support for the drag and drop components.
+//
+// -----------------------------------------------------------------------------
 // TODO : Default event for target components should be OnDrop.
 // TODO : Add parent form to Target property editor list.
-// -----------------------------------------------------------------------------
-// Project:         Drag and Drop Component Suite
-// Module:          DragDropDesign
-// Description:     Contains design-time support for the drag and drop
-//                  components.
-// Version:         5.2
-// Date:            17-AUG-2010
-// Target:          Win32, Delphi 5-2010
-// Authors:         Anders Melander, anders@melander.dk, http://melander.dk
-// Copyright        © 1997-1999 Angus Johnson & Anders Melander
-//                  © 2000-2010 Anders Melander
-// -----------------------------------------------------------------------------
 
 interface
 
@@ -23,9 +28,11 @@ procedure Register;
 implementation
 
 uses
+  System.Classes,
+  Windows,
   DesignIntf,
   DesignEditors,
-  System.Classes,
+  ToolsAPI,
   DragDrop,
   DropSource,
   DropTarget,
@@ -80,4 +87,10 @@ begin
     Proc(TDataFormatClasses.Formats[i].ClassName);
 end;
 
+var
+  SplashScreen: HBITMAP;
+
+initialization
+  SplashScreen := LoadBitmap(hInstance, 'DRAGDROPSUITE');
+  (SplashScreenServices as IOTasplashScreenServices).AddPluginBitmap('Drag and Drop Component Suite', SplashScreen, False, 'Open Source', 'Private build');
 end.
